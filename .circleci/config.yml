@@ -1,0 +1,132 @@
+version: 2.1
+
+executors:
+  go-exec:
+    docker:
+      - image: cimg/go:1.22
+    working_directory: ~/project/cmd/urnet-client
+
+commands:
+  halt-if-no-client-changes:
+    description: "Halt job if no files changed under connect/cmd/urnet-client (or CI files)"
+    steps:
+      - run:
+          name: Skip if no relevant changes in connect/cmd/urnet-client
+          shell: /bin/bash -eo pipefail
+          command: |
+            set -u
+            git fetch --no-tags --depth=1 origin "+refs/heads/*:refs/remotes/origin/*" || true
+            BASE_REF="origin/main"
+            if [ "${CIRCLE_BRANCH:-}" = "main" ]; then
+              BASE_REF="$(git rev-list HEAD^ -n 1 2>/dev/null || echo HEAD)"
+            elif git rev-parse --verify origin/main >/dev/null 2>&1; then
+              BASE_REF="origin/main"
+            else
+              BASE_REF="$(git rev-list --max-parents=0 HEAD)"
+            fi
+            echo "Diffing against ${BASE_REF} -> HEAD"
+            CHANGED=$(git diff --name-only "${BASE_REF}"...HEAD | grep -E '^(connect/cmd/urnet-client/|connect/cmd/urnet-client/Dockerfile|\.circleci/)' || true)
+            if [ -z "${CHANGED}" ]; then
+              echo "No relevant changes detected; halting job."
+              circleci-agent step halt
+            else
+              echo "Relevant changes:\n${CHANGED}"
+            fi
+
+jobs:
+  test:
+    executor: go-exec
+    steps:
+      - run:
+          name: Skip for now
+          command: exit 0
+      # - checkout
+      # # - halt-if-no-client-changes
+      # - run: go version
+      # - run: go env
+      # - run:
+      #     name: Download modules
+      #     command: go mod download
+      # - run:
+      #     name: Run unit tests
+      #     command: go test -v .
+
+  build-linux:
+    executor: go-exec
+    parameters:
+      arch:
+        type: enum
+        enum: ["amd64", "arm64"]
+    steps:
+      - checkout
+      # - halt-if-no-client-changes
+      - run:
+          name: Build urnet-client for linux/<< parameters.arch >>
+          command: |
+            mkdir -p dist/linux_<< parameters.arch >>
+            CGO_ENABLED=0 GOOS=linux GOARCH=<< parameters.arch >> \
+              go build -trimpath -ldflags "-s -w" -o dist/linux_<< parameters.arch >>/urnet-client .
+      - run:
+          name: Show binary details
+          command: |
+            file dist/linux_<< parameters.arch >>/urnet-client || true
+            du -h dist/linux_<< parameters.arch >>/urnet-client || true
+      - store_artifacts:
+          path: dist/linux_<< parameters.arch >>
+          destination: dist/linux_<< parameters.arch >>
+
+  docker-publish-ghcr:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      # - halt-if-no-client-changes
+      - setup_remote_docker:
+          version: default
+          docker_layer_caching: true
+      - run:
+          name: Log in to GHCR
+          command: |
+            : "${GHCR_USERNAME:?GHCR_USERNAME not set}"
+            : "${GHCR_TOKEN:?GHCR_TOKEN not set}"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+      - run:
+          name: Enable binfmt for multi-arch builds
+          command: |
+            docker run --privileged --rm tonistiigi/binfmt --install all
+      - run:
+          name: Buildx setup
+          command: |
+            docker buildx create --use --name urnetx || docker buildx use urnetx
+            docker buildx inspect --bootstrap
+      - run:
+          name: Build and push multi-arch image to GHCR
+          command: |
+            REPO_IMAGE=${GHCR_IMAGE:-ghcr.io/${GHCR_USERNAME}/urnetwork-client}
+            VERSION=${CIRCLE_TAG:-${CIRCLE_SHA1:0:7}}
+            echo "Pushing ${REPO_IMAGE}:${VERSION} and :latest"
+            DOCKER_BUILDKIT=1 docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              -f cmd/urnet-client/Dockerfile \
+              -t ${REPO_IMAGE}:${VERSION} \
+              -t ${REPO_IMAGE}:latest \
+              . \
+              --push
+
+workflows:
+  build_and_test:
+    jobs:
+      - test
+      - build-linux:
+          name: build-linux-<< matrix.arch >>
+          requires:
+            - test
+          matrix:
+            parameters:
+              arch: ["amd64", "arm64"]
+      - docker-publish-ghcr:
+          name: docker-publish-ghcr
+          requires:
+            - test
+          context:
+            - Github-Docker-Auth
